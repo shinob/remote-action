@@ -23,7 +23,10 @@
     アクション:
       click      x, y（必須。全モニター撮影の画像上の座標） / button: left|right|middle（既定 left） / double: true|false
                  delayMs: クリック前の待ち時間 / returnCursor: クリック後にマウスを元の位置に戻す
-      type       text: 入力する文字列（日本語可。改行は Enter、タブは Tab として送る）
+      drag       x, y（開始）と toX, toY（終了）が必須 / button（既定 left）
+                 steps: 途中の移動回数（既定 20） / durationMs: 移動にかける時間（既定 500）
+                 holdMs: 押してから動き始めるまでの待ち時間（既定 200） / delayMs / returnCursor
+      type      text: 入力する文字列（日本語可。改行は Enter、タブは Tab として送る）
                  intervalMs: 1文字ごとの間隔（既定 10）
       key        keys: "Enter" "Tab" "Esc" "Ctrl+A" "Shift+Tab" などのキー指定
       wait       ms: 待ち時間（既定 1000）
@@ -140,6 +143,29 @@ public static class RemoteActionNative {
         inputs[1].u.mi.dwFlags = upFlag;
         Send(inputs);
     }
+
+    // ボタンを押す、または離すだけの入力を1つ送る（ドラッグ用）
+    public static void MouseButton(uint flag) {
+        INPUT[] inputs = new INPUT[1];
+        inputs[0].type = INPUT_MOUSE;
+        inputs[0].u.mi.dwFlags = flag;
+        Send(inputs);
+    }
+
+    const uint MOUSEEVENTF_MOVE = 0x0001;
+    const uint MOUSEEVENTF_VIRTUALDESK = 0x4000;
+    const uint MOUSEEVENTF_ABSOLUTE = 0x8000;
+
+    // 画面座標 (x, y) へ、実際のマウスに近い移動イベントで動かす
+    // 座標は仮想スクリーン（全モニター）基準の 0〜65535 に正規化して送る
+    public static void MoveTo(int x, int y, int vsX, int vsY, int vsW, int vsH) {
+        INPUT[] inputs = new INPUT[1];
+        inputs[0].type = INPUT_MOUSE;
+        inputs[0].u.mi.dx = (int)Math.Round((x - vsX) * 65535.0 / Math.Max(vsW - 1, 1));
+        inputs[0].u.mi.dy = (int)Math.Round((y - vsY) * 65535.0 / Math.Max(vsH - 1, 1));
+        inputs[0].u.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+        Send(inputs);
+    }
 }
 '@
 
@@ -165,26 +191,36 @@ function Get-Prop($Obj, [string]$Name, $Default) {
     return $Default
 }
 
-function Invoke-Click($A) {
-    if ($null -eq (Get-Prop $A 'x' $null) -or $null -eq (Get-Prop $A 'y' $null)) {
-        throw 'click には x と y が必要です'
-    }
-    # x, y は全モニター撮影（mode=All）の画像上の座標。
-    # 画像の左上 (0,0) は仮想スクリーンの左上（メインより左・上にモニターがあると負の座標）に当たるので、
-    # その分を足して実際の画面座標に変換する。
+# x, y は全モニター撮影（mode=All）の画像上の座標。
+# 画像の左上 (0,0) は仮想スクリーンの左上（メインより左・上にモニターがあると負の座標）に当たるので、
+# その分を足して実際の画面座標に変換する。
+function Convert-ImageToScreen($ImgX, $ImgY) {
     $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
-    $imgX = [int]$A.x
-    $imgY = [int]$A.y
-    if ($imgX -lt 0 -or $imgY -lt 0 -or $imgX -ge $vs.Width -or $imgY -ge $vs.Height) {
-        throw "座標 ($imgX, $imgY) が画像の範囲外です（全モニター画像: $($vs.Width)x$($vs.Height)）"
+    $ix = [int]$ImgX
+    $iy = [int]$ImgY
+    if ($ix -lt 0 -or $iy -lt 0 -or $ix -ge $vs.Width -or $iy -ge $vs.Height) {
+        throw "座標 ($ix, $iy) が画像の範囲外です（全モニター画像: $($vs.Width)x$($vs.Height)）"
     }
-    $x = $imgX + $vs.X
-    $y = $imgY + $vs.Y
+    return [pscustomobject]@{ ImgX = $ix; ImgY = $iy; X = $ix + $vs.X; Y = $iy + $vs.Y }
+}
 
+function Get-Button($A) {
     $button = ([string](Get-Prop $A 'button' 'left')).ToLower()
     if (-not $buttonFlags.ContainsKey($button)) {
         throw "button の値が不正です: $button（left / right / middle）"
     }
+    return $button
+}
+
+function Invoke-Click($A) {
+    if ($null -eq (Get-Prop $A 'x' $null) -or $null -eq (Get-Prop $A 'y' $null)) {
+        throw 'click には x と y が必要です'
+    }
+    $p = Convert-ImageToScreen $A.x $A.y
+    $imgX = $p.ImgX; $imgY = $p.ImgY
+    $x = $p.X; $y = $p.Y
+
+    $button = Get-Button $A
     $double       = [bool](Get-Prop $A 'double' $false)
     $delayMs      = [int](Get-Prop $A 'delayMs' 0)
     $returnCursor = [bool](Get-Prop $A 'returnCursor' $false)
@@ -211,6 +247,71 @@ function Invoke-Click($A) {
     }
 
     return [ordered]@{ x = $imgX; y = $imgY; screenX = $x; screenY = $y; button = $button; double = $double }
+}
+
+function Invoke-Drag($A) {
+    foreach ($n in 'x', 'y', 'toX', 'toY') {
+        if ($null -eq (Get-Prop $A $n $null)) { throw 'drag には x, y, toX, toY が必要です' }
+    }
+    $from = Convert-ImageToScreen $A.x $A.y
+    $to   = Convert-ImageToScreen $A.toX $A.toY
+    $button = Get-Button $A
+
+    $steps        = [Math]::Max(1, [int](Get-Prop $A 'steps' 20))
+    $durationMs   = [Math]::Max(0, [int](Get-Prop $A 'durationMs' 500))
+    $holdMs       = [Math]::Max(0, [int](Get-Prop $A 'holdMs' 200))
+    $delayMs      = [int](Get-Prop $A 'delayMs' 0)
+    $returnCursor = [bool](Get-Prop $A 'returnCursor' $false)
+
+    if ($delayMs -gt 0) { Start-Sleep -Milliseconds $delayMs }
+
+    $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
+    $original = [System.Windows.Forms.Cursor]::Position
+    $flags = $buttonFlags[$button]
+
+    [RemoteActionNative]::MoveTo($from.X, $from.Y, $vs.X, $vs.Y, $vs.Width, $vs.Height)
+    Start-Sleep -Milliseconds 50
+
+    [RemoteActionNative]::MouseButton($flags[0])
+    try {
+        if ($holdMs -gt 0) { Start-Sleep -Milliseconds $holdMs }
+
+        $dx = $to.X - $from.X
+        $dy = $to.Y - $from.Y
+        $dist = [Math]::Sqrt($dx * $dx + $dy * $dy)
+        # ドラッグ開始のしきい値（数ピクセル）を超えるため、まず目的の方向へ少しだけ動かす
+        if ($dist -gt 8) {
+            $nx = $from.X + [int][Math]::Round($dx * 4 / $dist)
+            $ny = $from.Y + [int][Math]::Round($dy * 4 / $dist)
+            [RemoteActionNative]::MoveTo($nx, $ny, $vs.X, $vs.Y, $vs.Width, $vs.Height)
+            Start-Sleep -Milliseconds 30
+        }
+
+        $stepMs = [int]($durationMs / $steps)
+        for ($i = 1; $i -le $steps; $i++) {
+            $px = $from.X + [int][Math]::Round($dx * $i / $steps)
+            $py = $from.Y + [int][Math]::Round($dy * $i / $steps)
+            [RemoteActionNative]::MoveTo($px, $py, $vs.X, $vs.Y, $vs.Width, $vs.Height)
+            if ($stepMs -gt 0) { Start-Sleep -Milliseconds $stepMs }
+        }
+        # 正規化の丸めで1ピクセルずれることがあるので、最後は SetCursorPos で正確に合わせる
+        [void][RemoteActionNative]::SetCursorPos($to.X, $to.Y)
+        Start-Sleep -Milliseconds 100
+    } finally {
+        # 途中で失敗しても、ボタンが押されたままにならないように必ず離す
+        [RemoteActionNative]::MouseButton($flags[1])
+    }
+
+    if ($returnCursor) {
+        Start-Sleep -Milliseconds 100
+        [void][RemoteActionNative]::SetCursorPos($original.X, $original.Y)
+    }
+
+    return [ordered]@{
+        x = $from.ImgX; y = $from.ImgY; toX = $to.ImgX; toY = $to.ImgY
+        screenX = $from.X; screenY = $from.Y; screenToX = $to.X; screenToY = $to.Y
+        button = $button; steps = $steps; durationMs = $durationMs
+    }
 }
 
 # キー名の別名（System.Windows.Forms.Keys の名前に変換する）
@@ -308,6 +409,10 @@ try {
                     $info = Invoke-Click $a
                     foreach ($k in $info.Keys) { $step[$k] = $info[$k] }
                 }
+                'drag' {
+                    $info = Invoke-Drag $a
+                    foreach ($k in $info.Keys) { $step[$k] = $info[$k] }
+                }
                 'type' {
                     $info = Invoke-Type $a
                     foreach ($k in $info.Keys) { $step[$k] = $info[$k] }
@@ -328,7 +433,7 @@ try {
                     $step.file = [string]$file
                 }
                 default {
-                    throw "不明なアクションです: '$name'（click / type / key / wait / screenshot）"
+                    throw "不明なアクションです: '$name'（click / drag / type / key / wait / screenshot）"
                 }
             }
             $step.success = $true

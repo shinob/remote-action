@@ -22,6 +22,10 @@
     .\Invoke-RemoteAction.ps1 -X 500 -Y 300 -Double -ReturnCursor
 
 .EXAMPLE
+    # (300, 200) から (800, 450) へドラッグし、1秒後にスクリーンショットを撮る
+    .\Invoke-RemoteAction.ps1 -X 300 -Y 200 -ToX 800 -ToY 450 -Screenshot
+
+.EXAMPLE
     # 入力欄をクリックし、中身を消してから文字を入力し、Enter を押して撮影する
     .\Invoke-RemoteAction.ps1 -X 700 -Y 147 -ClearFirst -Text "サンプル" -PressEnter -Screenshot
 
@@ -38,6 +42,13 @@ param(
 
     [switch]$Double,
     [switch]$ReturnCursor,
+
+    # ドラッグの終了座標（指定すると、-X/-Y から -ToX/-ToY へドラッグする）
+    [Nullable[int]]$ToX,
+    [Nullable[int]]$ToY,
+
+    # ドラッグの移動にかける時間（ミリ秒）
+    [int]$DurationMs = 500,
 
     # クリックの後に入力する文字列（クリックしない場合は、今フォーカスがある場所に入力）
     [string]$Text,
@@ -81,7 +92,28 @@ if ($Json) {
     if (($null -ne $X) -xor ($null -ne $Y)) {
         throw '-X と -Y は両方指定してください'
     }
-    if ($null -ne $X) {
+    if (($null -ne $ToX) -xor ($null -ne $ToY)) {
+        throw '-ToX と -ToY は両方指定してください'
+    }
+    $isDrag = $null -ne $ToX
+    if ($isDrag -and $null -eq $X) {
+        throw 'ドラッグには開始座標 -X/-Y が必要です'
+    }
+    if ($isDrag -and $Double) {
+        throw '-Double と -ToX/-ToY は同時に指定できません'
+    }
+    if ($isDrag) {
+        $actions += [ordered]@{
+            action       = 'drag'
+            x            = $X
+            y            = $Y
+            toX          = $ToX
+            toY          = $ToY
+            button       = $Button
+            durationMs   = $DurationMs
+            returnCursor = [bool]$ReturnCursor
+        }
+    } elseif ($null -ne $X) {
         $actions += [ordered]@{
             action       = 'click'
             x            = $X
@@ -113,7 +145,7 @@ if ($Json) {
         $actions += [ordered]@{ action = 'screenshot' }
     }
     if ($actions.Count -eq 0) {
-        throw '操作がありません。-X/-Y、-Text、-Screenshot、-Json のいずれかを指定してください'
+        throw '操作がありません。-X/-Y（-ToX/-ToY）、-Text、-Screenshot、-Json のいずれかを指定してください'
     }
     $request = [ordered]@{ id = $id; actions = $actions }
 }
@@ -135,6 +167,11 @@ $plannedActions = @(if ($request.actions) { $request.actions } else { $request }
 foreach ($a in $plannedActions) {
     if ($a.action -eq 'wait') { $plannedMs += $(if ($null -ne $a.ms) { [int]$a.ms } else { 1000 }) }
     if ($a.action -eq 'click' -and $null -ne $a.delayMs) { $plannedMs += [int]$a.delayMs }
+    if ($a.action -eq 'drag') {
+        $plannedMs += $(if ($null -ne $a.durationMs) { [int]$a.durationMs } else { 500 })
+        $plannedMs += $(if ($null -ne $a.holdMs) { [int]$a.holdMs } else { 200 })
+        if ($null -ne $a.delayMs) { $plannedMs += [int]$a.delayMs }
+    }
 }
 $deadline = (Get-Date).AddSeconds($TimeoutSec).AddMilliseconds($plannedMs)
 $result = $null
